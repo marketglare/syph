@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Treponema — prototype v3 (single-file)</title>
+<style>
+ html,body{height:100%;margin:0;background:#061318;color:#e6f6ff;font-family:system-ui,Segoe UI,Roboto,Arial}
+ #app{height:100%;display:flex;flex-direction:column}
+ #view{flex:1;position:relative;overflow:hidden}
+ canvas{display:block}
+ .hud{position:absolute;right:12px;bottom:12px;background:rgba(0,0,0,0.45);backdrop-filter:blur(4px);padding:10px;border-radius:8px;display:flex;flex-direction:column;gap:8px;min-width:220px}
+ .controls{display:flex;flex-direction:column;gap:8px}
+ .hud button{padding:8px 12px;border-radius:6px;border:0;background:#ff6b6b;color:#111;font-weight:600;cursor:pointer}
+ .hud button.muted{background:#444;color:#ddd;cursor:default}
+ .stat{font-size:14px}
+ .banner{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(10,10,10,0.9);padding:18px;border-radius:10px;display:none;max-width:90%;white-space:pre-wrap}
+ .banner.show{display:block}
+/* Modal common */
+ .modal-backdrop{position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:9999}
+ .modal{background:#071216;color:#e6f6ff;padding:18px;border-radius:10px;max-width:640px;max-height:80%;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,0.7)}
+ .modal h2{margin-top:0}
+ .modal .close{margin-top:12px;padding:8px 12px;background:#ff6b6b;border:0;border-radius:6px;cursor:pointer}
+ .hud .small-actions{display:flex;flex-direction:column;gap:6px}
+</style>
+</head>
+<body>
+<div id="app">
+ <div id="view"></div>
+ <div class="hud" id="hud">
+  <div class="controls">
+   <button id="startBtn">Start</button>
+   <button id="killBtn" class="muted">Kill (2)</button>
+  </div>
+  <div class="stat" id="spCount">T. pallidum: 0</div>
+  <div class="stat" id="killedCount">Total killed: 0</div>
+  <div class="stat" id="recordMaxPop">Peak population: 0</div>
+  <div class="stat" id="timeStat">Time: 00:00:00</div>
+  <div class="stat" id="recovery">Recover in: —</div>
+  <div class="small-actions">
+    <button id="rulesBtn">Rules</button>
+    <button id="donatesBtn">Donates</button>
+  </div>
+ </div>
+ <div class="banner" id="banner"></div>
+</div>
+
+<!-- Modal containers -->
+<div class="modal-backdrop" id="modalBackdrop">
+ <div class="modal" id="modalContent">
+  <div id="modalInner"></div>
+  <button class="close" id="modalClose">Close</button>
+ </div>
+</div>
+
+<!-- three.js CDN -->
+<script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+<script>
+/* Simple value-noise for "flow" */
+class SimpleNoise {
+ constructor(seed=1){ this.seed = seed; }
+ rand(x){ return fract(Math.sin(x*127.1 + this.seed*311.7)*43758.5453); }
+ smooth(x){ return this.rand(x)*0.5 + this.rand(x+1)*0.5; }
+ noise(x){ return this.smooth(x); }
+}
+function fract(v){ return v - Math.floor(v); }
+</script>
+<script>
+(() => {
+ // CONFIG
+ const CONFIG = {
+  gameday_s: 60,
+  division_period_real_s: 30,
+  divisionAnim_s: 1.2,
+  startCount: 1,
+  maxSpirals: 1500,
+  killMaxCharges: 2,
+  killCooldownBetweenUses_s: 30,
+  sleepProbabilityOnKill: 0.3,
+  sleepDurationRange_s: [60,180], // 60-180s (1-3 min)
+  lodThreshold: 250
+ };
+
+ const container = document.getElementById('view');
+ const scene = new THREE.Scene();
+ const camera = new THREE.PerspectiveCamera(50, container.clientWidth/container.clientHeight, 0.1, 2000);
+ camera.position.set(0, 0, 160);
+ const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false});
+ renderer.setSize(Math.max(700, container.clientWidth), Math.max(420, container.clientHeight));
+ container.appendChild(renderer.domElement);
+ renderer.setClearColor(0x061318);
+ const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+ dirLight.position.set(1,1,1);
+ scene.add(dirLight);
+ scene.add(new THREE.AmbientLight(0x404050, 0.9));
+ const rand = (a,b)=> a + Math.random()*(b-a);
+ const clamp = (v,a,b)=> Math.max(a, Math.min(b, v));
+
+ function createSpiralGeometry(turns=8, length=40, tubeRadius=0.9, radialSegments=8, tubularSegments=300, scaleFactor=1/3){
+  const pts = [];
+  for(let i=0;i<=tubularSegments;i++){
+   const t = i / tubularSegments;
+   const angle = t * Math.PI * 2 * turns;
+   const z = (t - 0.5) * length;
+   const r = 4.0 * (1 - 0.05 * t);
+   pts.push(new THREE.Vector3(Math.cos(angle)*r, Math.sin(angle)*r, z));
+  }
+  const path = new THREE.CatmullRomCurve3(pts);
+  const geom = new THREE.TubeGeometry(path, tubularSegments, tubeRadius, radialSegments, false);
+  geom.scale(scaleFactor, scaleFactor, scaleFactor);
+  return geom;
+ }
+
+ class Spiral {
+  constructor(id, seededPos=null){
+   this.id = id;
+   this.state = 'active';
+   this.pos = seededPos ? seededPos.clone() : new THREE.Vector3(rand(-40,40), rand(-24,24), rand(-10,10));
+   this.target = this._randTarget();
+   this.baseSpeed = rand(4.0,6.0);
+   this.birth = performance.now();
+   this.size = 1;
+   this.nextDivision = performance.now() + CONFIG.division_period_real_s*1000;
+   this.mesh = null;
+   this.sleepUntil = null;
+   this.isAnimatingDivision = false;
+   this.noiseOffset = Math.random()*1000;
+   this._dead = false;
+   this.createMesh();
+  }
+  _randTarget(){ return new THREE.Vector3(rand(-100,100), rand(-60,60), rand(-15,15)); }
+  createMesh(){
+   const geom = createSpiralGeometry(8, 48, 0.9, 10, 300, 1/3);
+   const mat = new THREE.MeshStandardMaterial({color:0xdfeefe, metalness:0.05, roughness:0.6});
+   const mesh = new THREE.Mesh(geom, mat);
+   mesh.castShadow = false; mesh.receiveShadow = false;
+   mesh.position.copy(this.pos);
+   mesh.rotation.set(rand(-0.2,0.2), rand(-0.2,0.2), rand(-3.14,3.14));
+   this.mesh = mesh;
+   scene.add(mesh);
+  }
+  toPointLOD(){
+   if(this.mesh){ scene.remove(this.mesh); try{ this.mesh.geometry.dispose(); this.mesh.material.dispose(); }catch{} this.mesh=null; }
+   const geom = new THREE.SphereGeometry(0.35,8,8);
+   const mat = new THREE.MeshBasicMaterial({color:0xdfeefe});
+   const m = new THREE.Mesh(geom, mat);
+   m.position.copy(this.pos);
+   this.mesh = m;
+   scene.add(m);
+  }
+  restoreSpiralMesh(){
+   if(this.mesh){ scene.remove(this.mesh); try{ this.mesh.geometry.dispose(); this.mesh.material.dispose(); }catch{} this.mesh=null; }
+   this.createMesh();
+  }
+  update(dt, time, noise){
+   if(this._dead) return;
+   if(this.state === 'sleeping'){
+    if(time >= this.sleepUntil) this.wake();
+    else {
+     const flow = new THREE.Vector3(noise.noise((time+this.noiseOffset)/8000)-0.5, noise.noise((time+this.noiseOffset+2000)/8000)-0.5, 0).multiplyScalar(0.01*dt);
+     this.pos.add(flow);
+     if(this.mesh){ this.mesh.position.copy(this.pos); this.mesh.scale.setScalar(0.45); this.mesh.rotation.z += 0.0008 * dt; }
+     return;
+    }
+   }
+   const toTarget = new THREE.Vector3().subVectors(this.target, this.pos);
+   const dist = toTarget.length();
+   if(dist < 1.0) this.target = this._randTarget();
+   toTarget.normalize();
+   const flow = new THREE.Vector3(
+    noise.noise((time+this.noiseOffset)/4000)-0.5,
+    noise.noise((time+this.noiseOffset+1200)/4000)-0.5,
+    noise.noise((time+this.noiseOffset+2400)/4000)-0.5
+   ).multiplyScalar(0.25);
+   const move = toTarget.multiplyScalar(this.baseSpeed * dt/1000).add(flow.multiplyScalar(dt/1000*20));
+   this.pos.add(move);
+   const bounds = {x:120,y:72,z:20};
+   if(this.pos.x > bounds.x) this.pos.x = bounds.x - (this.pos.x - bounds.x);
+   if(this.pos.x < -bounds.x) this.pos.x = -bounds.x - (this.pos.x + bounds.x);
+   if(this.pos.y > bounds.y) this.pos.y = bounds.y - (this.pos.y - bounds.y);
+   if(this.pos.y < -bounds.y) this.pos.y = -bounds.y - (this.pos.y + bounds.y);
+   if(this.pos.z > bounds.z) this.pos.z = bounds.z - (this.pos.z - bounds.z);
+   if(this.pos.z < -bounds.z) this.pos.z = -bounds.z - (this.pos.z + bounds.z);
+   if(this.mesh){ this.mesh.position.copy(this.pos); this.mesh.rotation.z += 0.0006 * dt * (this.id % 2 ? 1 : -1); }
+   if(!this.isAnimatingDivision && performance.now() >= this.nextDivision) this.startDivision();
+  }
+  startDivision(){
+   if(this._dead || this.state==='sleeping') return;
+   this.isAnimatingDivision = true;
+   const animStart = performance.now();
+   const dur = CONFIG.divisionAnim_s*1000;
+   const initialScale = this.mesh ? this.mesh.scale.clone() : new THREE.Vector3(1,1,1);
+   const tick = () => {
+    const now = performance.now();
+    const t = (now - animStart) / dur;
+    if(t < 1){
+     const s = 1 - 0.45 * Math.sin(Math.min(1,t)*Math.PI);
+     if(this.mesh) this.mesh.scale.set(1.0, s, s*0.9);
+     requestAnimationFrame(tick);
+    } else {
+     if(this.mesh) this.mesh.scale.copy(initialScale);
+     this.finishDivision();
+     this.isAnimatingDivision = false;
+    }
+   };
+   tick();
+  }
+  finishDivision(){
+   this.nextDivision = performance.now() + CONFIG.division_period_real_s*1000;
+   const childPos = this.pos.clone().add(new THREE.Vector3(rand(-2,2), rand(-1.5,1.5), rand(-0.8,0.8)));
+   const child = new Spiral(Spiral.nextId++, childPos);
+   child.nextDivision = performance.now() + CONFIG.division_period_real_s*1000 + rand(500,5000);
+   addSpiral(child);
+  }
+  killAttempt(p_hit, rng){
+   if(this.state === 'sleeping') return 'immune';
+   const r = rng();
+   if(r < p_hit){ this.dispose(); return 'dead'; }
+   if(rng() < CONFIG.sleepProbabilityOnKill){ this.goToSleep(); return 'slept'; }
+   return 'survived';
+  }
+  goToSleep(){
+   this.state = 'sleeping';
+   this.sleepUntil = performance.now() + rand(CONFIG.sleepDurationRange_s[0]*1000, CONFIG.sleepDurationRange_s[1]*1000);
+   if(this.mesh){
+    scene.remove(this.mesh);
+    try{ this.mesh.geometry.dispose(); this.mesh.material.dispose(); }catch{}
+    const geom = new THREE.SphereGeometry(0.5,12,12);
+    const mat = new THREE.MeshStandardMaterial({color:0x8fbfb0, transparent:true, opacity:0.55});
+    const m = new THREE.Mesh(geom, mat);
+    m.position.copy(this.pos);
+    this.mesh = m;
+    scene.add(this.mesh);
+   }
+  }
+  wake(){
+   this.state = 'active';
+   this.sleepUntil = null;
+   this.nextDivision = performance.now() + rand(2000, CONFIG.division_period_real_s*1000);
+   if(this.mesh){ scene.remove(this.mesh); try{ this.mesh.geometry.dispose(); this.mesh.material.dispose(); }catch{} this.createMesh(); this.mesh.scale.set(1,1,1); }
+  }
+  dispose(){
+   if(this.mesh){ scene.remove(this.mesh); try{ this.mesh.geometry.dispose(); this.mesh.material.dispose(); }catch{} this.mesh = null; }
+   this._dead = true;
+  }
+ }
+ Spiral.nextId = 1;
+
+ const spirals = [];
+ let totalKilled = 0;
+// Peak population is stored in localStorage for persistence, but requirement #1: reset peak on new game
+ let recordMaxPop = parseInt(localStorage.getItem('tp_record_maxpop')||'0',10);
+
+ function addSpiral(s){ spirals.push(s); updateHUD(); checkAndUpdateMaxPop(); }
+ function removeDead(){
+  for(let i=spirals.length-1;i>=0;i--){ if(spirals[i]._dead) spirals.splice(i,1); }
+  updateHUD();
+ }
+ function checkAndUpdateMaxPop(){
+  if(spirals.length > recordMaxPop){
+   recordMaxPop = spirals.length;
+   localStorage.setItem('tp_record_maxpop', String(recordMaxPop));
+   document.getElementById('recordMaxPop').textContent = 'Peak population: ' + recordMaxPop;
+  }
+ }
+
+ const noise = new SimpleNoise(Math.random()*1000);
+ let running = false;
+ let last = performance.now();
+ let lodMode = false;
+ let charges = CONFIG.killMaxCharges;
+ let nextChargeReadyAt = null;
+
+ const killBtn = document.getElementById('killBtn');
+ const startBtn = document.getElementById('startBtn');
+ const spCountEl = document.getElementById('spCount');
+ const killedCountEl = document.getElementById('killedCount');
+ const recordMaxPopEl = document.getElementById('recordMaxPop');
+ const recoveryEl = document.getElementById('recovery');
+ const timeStatEl = document.getElementById('timeStat');
+ const banner = document.getElementById('banner');
+
+ function formatTimeHHMMSS(secTotal){
+  const s = Math.floor(secTotal%60);
+  const m = Math.floor((secTotal/60)%60);
+  const h = Math.floor(secTotal/3600);
+  return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+ }
+ let gameStartAt = null;
+
+ function updateHUD(){
+  spCountEl.textContent = 'T. pallidum: ' + spirals.length;
+  killedCountEl.textContent = 'Total killed: ' + totalKilled;
+  recordMaxPopEl.textContent = 'Peak population: ' + recordMaxPop;
+  killBtn.textContent = `Kill (${charges})`;
+  if(charges > 0) killBtn.classList.remove('muted'); else killBtn.classList.add('muted');
+  if(running && gameStartAt){
+   const elapsed = (performance.now() - gameStartAt)/1000;
+   timeStatEl.textContent = 'Time: ' + formatTimeHHMMSS(elapsed);
+  }
+ }
+
+ function spawnInitial(count){
+  const bounds = {x:120, y:72, z:20};
+  const cols = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / cols);
+  let idx = 0;
+  for(let r=0;r<rows && idx<count;r++){
+   for(let c=0;c<cols && idx<count;c++){
+    const fx = (c + 0.5) / cols;
+    const fy = (r + 0.5) / rows;
+    const x = (fx - 0.5) * bounds.x * 2 + rand(-6,6);
+    const y = (fy - 0.5) * bounds.y * 2 + rand(-4,4);
+    const z = rand(-8,8);
+    addSpiral(new Spiral(Spiral.nextId++, new THREE.Vector3(x,y,z)));
+    idx++;
+   }
+  }
+ }
+
+ function resetGameStateBeforeStart(){
+  // Dispose existing spirals and reset arrays/counters and HUD values
+  for(const s of spirals) s.dispose();
+  spirals.length = 0;
+  Spiral.nextId = 1;
+  totalKilled = 0;
+  charges = CONFIG.killMaxCharges;
+  nextChargeReadyAt = null;
+  // Reset peak population per requirement
+  recordMaxPop = 0;
+  localStorage.setItem('tp_record_maxpop', String(recordMaxPop));
+  banner.classList.remove('show');
+  updateHUD();
+ }
+
+ function startGame(){
+  // Reset all counters including peak population
+  resetGameStateBeforeStart();
+  spawnInitial(CONFIG.startCount);
+  running = true;
+  last = performance.now();
+  gameStartAt = performance.now();
+  updateHUD();
+ }
+
+ function gameOver(victory=false){
+  running = false;
+  const msg = victory ? 'Victory over Treponema pallidum' : 'Defeat — overflow!';
+  banner.textContent = msg;
+  banner.classList.add('show');
+ }
+
+ function rng(){ return Math.random(); }
+ function compute_p_hit(sp){ return clamp(0.8 + (Math.random()-0.5)*0.2, 0.10, 0.97); }
+
+ function doKill(){
+  if(!running) return;
+  if(charges <= 0) return;
+  charges--;
+  if(charges < CONFIG.killMaxCharges && !nextChargeReadyAt) nextChargeReadyAt = performance.now() + CONFIG.killCooldownBetweenUses_s*1000;
+  updateHUD();
+  for(const s of spirals.slice()){
+   const p = compute_p_hit(s);
+   const res = s.killAttempt(p, rng);
+   if(res === 'dead') totalKilled++;
+  }
+  removeDead();
+  updateHUD();
+  if(spirals.length === 0) gameOver(true);
+ }
+
+ killBtn.addEventListener('click', ()=> doKill());
+ startBtn.addEventListener('click', ()=> startGame());
+
+ // Rules & Donates modals
+ const modalBackdrop = document.getElementById('modalBackdrop');
+ const modalInner = document.getElementById('modalInner');
+ const modalClose = document.getElementById('modalClose');
+
+ function showModal(html){
+  modalInner.innerHTML = html;
+  modalBackdrop.style.display = 'flex';
+ }
+ function closeModal(){ modalBackdrop.style.display = 'none'; modalInner.innerHTML = ''; }
+ modalClose.addEventListener('click', closeModal);
+ modalBackdrop.addEventListener('click', (e)=>{ if(e.target===modalBackdrop) closeModal(); });
+
+ const rulesBtn = document.getElementById('rulesBtn');
+ const donatesBtn = document.getElementById('donatesBtn');
+
+ rulesBtn.addEventListener('click', ()=> {
+  const txt = [
+   "This is a simulator of syphilis disease progression via division of the bacterium Treponema pallidum.",
+   "",
+   "Objective: defeat Treponema by eliminating the infectious agent from the host.",
+   "",
+   "The bacterium divides every 30 seconds (analogue of real 24 hours).",
+   "",
+   "Clicking the Kill button simulates an antibiotic action that hits Treponema with 70-95% probability.",
+   "",
+   "With 30% probability, when threatened, the bacterium can switch to a dormant L-form, stop dividing and become immune.",
+   "",
+   "Exit from dormancy is random within 1-10 in-game days (30s - 3min).",
+   "",
+   "Victory condition: all treponemes are eliminated.",
+   "Defeat condition: treponema population exceeds 1000 units."
+  ].join("\n");
+  showModal("<h2>Rules</h2><pre style='white-space:pre-wrap'>"+escapeHtml(txt)+"</pre>");
+ });
+
+ donatesBtn.addEventListener('click', ()=> {
+  const txt = [
+   "USDT (TRC-20) address: TSR63AMR4ToAyhFvGsBJ4C8ikAeM6Fn5TT",
+   "SHIB (ERC-20) address: 0x4C97c50666a5553326d2289e2dD683dE30145A33"
+  ].join("\n");
+  showModal("<h2>Donates</h2><pre style='white-space:pre-wrap'>"+escapeHtml(txt)+"</pre>");
+ });
+
+ function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+ // rAF + fixed timestep
+ let acc = 0;
+ const fixedDt = 16.6667;
+
+ function tickLoop(){
+  requestAnimationFrame(tickLoop);
+  const nowMs = performance.now();
+  let dt = nowMs - last;
+  if(dt > 1000) dt = 1000;
+  last = nowMs;
+  acc += dt;
+  while(acc >= fixedDt){ step(fixedDt); acc -= fixedDt; }
+  renderer.render(scene, camera);
+ }
+
+ function step(dt){
+  if(running){
+   if(charges < CONFIG.killMaxCharges && nextChargeReadyAt){
+    if(performance.now() >= nextChargeReadyAt){
+     charges++;
+     nextChargeReadyAt = performance.now() + CONFIG.killCooldownBetweenUses_s*1000;
+     if(charges >= CONFIG.killMaxCharges){ charges = CONFIG.killMaxCharges; nextChargeReadyAt = null; }
+    }
+   }
+   if(charges < CONFIG.killMaxCharges && nextChargeReadyAt){
+    const sLeft = Math.ceil((nextChargeReadyAt - performance.now())/1000);
+    recoveryEl.textContent = 'Recover in: ' + sLeft + 's';
+   } else recoveryEl.textContent = 'Recover in: —';
+
+   if(spirals.length > CONFIG.lodThreshold && !lodMode){ lodMode = true; spirals.forEach(s=>s.toPointLOD()); }
+   else if(spirals.length <= CONFIG.lodThreshold && lodMode){ lodMode = false; spirals.forEach(s=>s.restoreSpiralMesh()); }
+
+   for(const s of spirals.slice()) s.update(dt, performance.now(), noise);
+   removeDead();
+
+   if(spirals.length > CONFIG.maxSpirals) gameOver(false);
+   updateHUD();
+  }
+ }
+
+ // Start initial game
+ startGame();
+ requestAnimationFrame(tickLoop);
+
+ window.addEventListener('resize', ()=> {
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  renderer.setSize(Math.max(700,w), Math.max(420,h));
+  camera.aspect = renderer.domElement.width/renderer.domElement.height;
+  camera.updateProjectionMatrix();
+ });
+})();
+</script>
+</body>
+</html>
