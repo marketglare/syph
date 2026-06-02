@@ -27,34 +27,36 @@
 <div id="app">
  <div id="view"></div>
  <div class="hud" id="hud">
-  <div class="controls">
-   <button id="startBtn">Start</button>
-   <button id="killBtn" class="muted">Kill (2)</button>
-  </div>
-  <div class="stat" id="spCount">T. pallidum: 0</div>
-  <div class="stat" id="killedCount">Total killed: 0</div>
-  <div class="stat" id="recordMaxPop">Peak population: 0</div>
-  <div class="stat" id="timeStat">Time: 00:00:00</div>
-  <div class="stat" id="recovery">Recover in: —</div>
-  <div class="small-actions">
-   <button id="rulesBtn">Rules</button>
-   <button id="donatesBtn">Donates</button>
-  </div>
+ <div class="controls">
+ <button id="startBtn">Start</button>
+ <button id="killBtn" class="muted">Kill (2)</button>
+ </div>
+ <div class="stat" id="spCount">T. pallidum: 0</div>
+ <div class="stat" id="killedCount">Total killed: 0</div>
+ <div class="stat" id="recordMaxPop">Peak population: 0</div>
+ <div class="stat" id="timeStat">Time: 00:00:00</div>
+ <div class="stat" id="recovery">Recover in: —</div>
+ <div class="small-actions">
+ <button id="rulesBtn">Rules</button>
+ <button id="donatesBtn">Donates</button>
+ </div>
  </div>
  <div class="banner" id="banner"></div>
 </div>
-
 <div class="modal-backdrop" id="modalBackdrop">
  <div class="modal" id="modalContent">
-  <div id="modalInner"></div>
-  <button class="close" id="modalClose">Close</button>
+ <div id="modalInner"></div>
+ <button class="close" id="modalClose">Close</button>
  </div>
 </div>
 
-<!-- three.js must be loaded before main script -->
+<!-- Use current three.js via module-free CDN build (keeps local browser run) -->
 <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
-
 <script>
+/* =========================
+   Notes: keeps a single-file browser run (no modules), minimal API changes.
+   ========================= */
+
 /* Minimal noise */
 class SimpleNoise {
  constructor(seed=1){ this.seed = seed; }
@@ -65,7 +67,7 @@ class SimpleNoise {
 function fract(v){ return v - Math.floor(v); }
 
 (() => {
- // CONFIG
+ // CONFIG & ADAPTIVE SETTINGS
  const CONFIG = {
   gameday_s: 60,
   division_period_real_s: 30,
@@ -76,37 +78,55 @@ function fract(v){ return v - Math.floor(v); }
   killCooldownBetweenUses_s: 30,
   sleepProbabilityOnKill: 0.3,
   sleepDurationRange_s: [60,180],
-  lodThreshold: 250,
-  minRenderIntervalMs: 16
+  lodThreshold: 150,            // lowered threshold (use LOD earlier)
+  maxDetailedTubularSegments: 200, // reduced spiral geometry detail
+  minRenderIntervalMs: 1000/30, // default cap -> 30 FPS
+  highPerfRenderIntervalMs: 1000/60, // 60 FPS option
+  dynamicRenderScale: 0.75,    // default render scale
+  lowRenderScale: 0.6,         // scale when overloaded
+  perfSamplingMs: 2000,        // sampling window for perf metrics
+  autoThrottleFPSDropThreshold: 40, // ms/frame average before throttling
+  instancedBatchSize: 500      // instances per InstancedMesh
  };
+
+ // UI state for performance mode
+ let highPerfMode = false;
 
  // THREE setup
  const container = document.getElementById('view');
  const scene = new THREE.Scene();
  const camera = new THREE.PerspectiveCamera(50, container.clientWidth/container.clientHeight, 0.1, 2000);
  camera.position.set(0, 0, 160);
+
+ // renderer with pixel ratio and dynamic scaling
  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false});
- renderer.setSize(Math.max(700, container.clientWidth), Math.max(420, container.clientHeight));
- container.appendChild(renderer.domElement);
+ function applyRenderSize(scale=1){
+  const w = Math.max(700, Math.floor(container.clientWidth * scale));
+  const h = Math.max(420, Math.floor(container.clientHeight * scale));
+  renderer.setSize(w, h, false);
+  renderer.domElement.style.width = container.clientWidth + 'px';
+  renderer.domElement.style.height = container.clientHeight + 'px';
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+ }
+ let currentRenderScale = CONFIG.dynamicRenderScale;
  renderer.setClearColor(0x061318);
+ applyRenderSize(currentRenderScale);
+ container.appendChild(renderer.domElement);
+
+ // Lights
  scene.add(new THREE.DirectionalLight(0xffffff, 0.9));
  scene.add(new THREE.AmbientLight(0x404050, 0.9));
 
+ // utilities
  const rand = (a,b)=> a + Math.random()*(b-a);
  const clamp = (v,a,b)=> Math.max(a, Math.min(b, v));
 
- // Shared resources
- const Shared = { spiralGeom:null, spiralMat:null, lodGeom:null, lodMat:null, sleepingGeom:null, sleepingMat:null };
- function ensureSharedResources(){
-  if(!Shared.spiralGeom) Shared.spiralGeom = createSpiralGeometry(8,48,0.9,10,300,1/3);
-  if(!Shared.spiralMat) Shared.spiralMat = new THREE.MeshStandardMaterial({color:0xdfeefe, metalness:0.05, roughness:0.6});
-  if(!Shared.lodGeom) Shared.lodGeom = new THREE.SphereGeometry(0.35,8,8);
-  if(!Shared.lodMat) Shared.lodMat = new THREE.MeshBasicMaterial({color:0xdfeefe});
-  if(!Shared.sleepingGeom) Shared.sleepingGeom = new THREE.SphereGeometry(0.5,12,12);
-  if(!Shared.sleepingMat) Shared.sleepingMat = new THREE.MeshStandardMaterial({color:0x8fbfb0, transparent:true, opacity:0.55});
- }
+ // Shared resources (with lower-detail options)
+ const Shared = { spiralGeom:null, spiralMat:null, lodGeom:null, lodMat:null, sleepingGeom:null, sleepingMat:null, instancedLOD:null, instancedCount:0 };
 
- function createSpiralGeometry(turns=8, length=40, tubeRadius=0.9, radialSegments=8, tubularSegments=300, scaleFactor=1/3){
+ function createSpiralGeometry(turns=8, length=40, tubeRadius=0.9, radialSegments=8, tubularSegments=200, scaleFactor=1/3){
+  // reduced tubularSegments to CONFIG.maxDetailedTubularSegments by default
   const pts = new Array(tubularSegments+1);
   for(let i=0;i<=tubularSegments;i++){
    const t = i / tubularSegments;
@@ -121,6 +141,16 @@ function fract(v){ return v - Math.floor(v); }
   return geom;
  }
 
+ function ensureSharedResources(){
+  if(!Shared.spiralGeom) Shared.spiralGeom = createSpiralGeometry(8,48,0.9,6, CONFIG.maxDetailedTubularSegments, 1/3);
+  if(!Shared.spiralMat) Shared.spiralMat = new THREE.MeshStandardMaterial({color:0xdfeefe, metalness:0.02, roughness:0.7});
+  if(!Shared.lodGeom) Shared.lodGeom = new THREE.SphereGeometry(0.35,6,6);
+  if(!Shared.lodMat) Shared.lodMat = new THREE.MeshBasicMaterial({color:0xdfeefe});
+  if(!Shared.sleepingGeom) Shared.sleepingGeom = new THREE.SphereGeometry(0.5,8,8);
+  if(!Shared.sleepingMat) Shared.sleepingMat = new THREE.MeshStandardMaterial({color:0x8fbfb0, transparent:true, opacity:0.55});
+ }
+
+ // Spiral class with lighter update frequency for non-critical ops
  class Spiral {
   constructor(id, seededPos=null){
    this.id = id;
@@ -137,41 +167,55 @@ function fract(v){ return v - Math.floor(v); }
    this._dead = false;
    this._tmpVec = new THREE.Vector3();
    this._toTarget = new THREE.Vector3();
+   this._lastLittleUpdate = 0; // for reduced-frequency small updates
    this.createMesh();
   }
   _randTarget(){ return new THREE.Vector3(rand(-100,100), rand(-60,60), rand(-15,15)); }
   createMesh(){ ensureSharedResources(); const mesh = new THREE.Mesh(Shared.spiralGeom, Shared.spiralMat); mesh.position.copy(this.pos); mesh.rotation.set(rand(-0.2,0.2), rand(-0.2,0.2), rand(-3.14,3.14)); this.mesh = mesh; scene.add(mesh); }
-  toPointLOD(){ if(this.mesh){ scene.remove(this.mesh); this.mesh = null; } ensureSharedResources(); const m = new THREE.Mesh(Shared.lodGeom, Shared.lodMat); m.position.copy(this.pos); this.mesh = m; scene.add(m); }
+  toPointLOD(){ if(this.mesh){ scene.remove(this.mesh); this.mesh = null; } ensureSharedResources(); // actual LOD uses instancing where possible (handled globally)
+   const m = new THREE.Mesh(Shared.lodGeom, Shared.lodMat); m.position.copy(this.pos); this.mesh = m; scene.add(m);
+  }
   restoreSpiralMesh(){ if(this.mesh){ scene.remove(this.mesh); this.mesh = null; } this.createMesh(); }
   update(dt, time, noise){
    if(this._dead) return;
+   // perform heavy noise sampling less often (every ~2 frames)
+   this._lastLittleUpdate += dt;
    if(this.state === 'sleeping'){
     if(time >= this.sleepUntil){ this.wake(); return; }
-    const flowX = noise.noise((time+this.noiseOffset)/8000)-0.5;
-    const flowY = noise.noise((time+this.noiseOffset+2000)/8000)-0.5;
-    this._tmpVec.set(flowX, flowY, 0).multiplyScalar(0.01*dt);
-    this.pos.add(this._tmpVec);
+    if(this._lastLittleUpdate > 50){ // reduce frequency of tiny updates
+     const flowX = noise.noise((time+this.noiseOffset)/8000)-0.5;
+     const flowY = noise.noise((time+this.noiseOffset+2000)/8000)-0.5;
+     this._tmpVec.set(flowX, flowY, 0).multiplyScalar(0.01*dt);
+     this.pos.add(this._tmpVec);
+     this._lastLittleUpdate = 0;
+    }
     if(this.mesh){ this.mesh.position.copy(this.pos); this.mesh.scale.setScalar(0.45); this.mesh.rotation.z += 0.0008 * dt; }
     return;
    }
-   this._toTarget.subVectors(this.target, this.pos);
-   const dist = this._toTarget.length();
+   // movement (moderate frequency)
+   const toTarget = this._toTarget;
+   toTarget.subVectors(this.target, this.pos);
+   const dist = toTarget.length();
    if(dist < 1.0) this.target = this._randTarget();
-   this._toTarget.normalize();
-   const flowX = noise.noise((time+this.noiseOffset)/4000)-0.5;
-   const flowY = noise.noise((time+this.noiseOffset+1200)/4000)-0.5;
-   const flowZ = noise.noise((time+this.noiseOffset+2400)/4000)-0.5;
-   const flow = this._tmpVec.set(flowX, flowY, flowZ).multiplyScalar(0.25);
-   const move = this._toTarget.multiplyScalar(this.baseSpeed * dt/1000);
-   move.add(flow.multiplyScalar(dt/1000*20));
-   this.pos.add(move);
-   const bx=120, by=72, bz=20;
-   if(this.pos.x > bx) this.pos.x = bx - (this.pos.x - bx);
-   if(this.pos.x < -bx) this.pos.x = -bx - (this.pos.x + bx);
-   if(this.pos.y > by) this.pos.y = by - (this.pos.y - by);
-   if(this.pos.y < -by) this.pos.y = -by - (this.pos.y + by);
-   if(this.pos.z > bz) this.pos.z = bz - (this.pos.z - bz);
-   if(this.pos.z < -bz) this.pos.z = -bz - (this.pos.z + bz);
+   toTarget.normalize();
+   if(this._lastLittleUpdate > 30){
+    const flowX = noise.noise((time+this.noiseOffset)/4000)-0.5;
+    const flowY = noise.noise((time+this.noiseOffset+1200)/4000)-0.5;
+    const flowZ = noise.noise((time+this.noiseOffset+2400)/4000)-0.5;
+    const flow = this._tmpVec.set(flowX, flowY, flowZ).multiplyScalar(0.25);
+    const move = toTarget.multiplyScalar(this.baseSpeed * dt/1000);
+    move.add(flow.multiplyScalar(dt/1000*20));
+    this.pos.add(move);
+    // simple bounds reflect
+    const bx=120, by=72, bz=20;
+    if(this.pos.x > bx) this.pos.x = bx - (this.pos.x - bx);
+    if(this.pos.x < -bx) this.pos.x = -bx - (this.pos.x + bx);
+    if(this.pos.y > by) this.pos.y = by - (this.pos.y - by);
+    if(this.pos.y < -by) this.pos.y = -by - (this.pos.y + by);
+    if(this.pos.z > bz) this.pos.z = bz - (this.pos.z - bz);
+    if(this.pos.z < -bz) this.pos.z = -bz - (this.pos.z + bz);
+    this._lastLittleUpdate = 0;
+   }
    if(this.mesh){ this.mesh.position.copy(this.pos); this.mesh.rotation.z += 0.0006 * dt * (this.id % 2 ? 1 : -1); }
    if(!this.isAnimatingDivision && performance.now() >= this.nextDivision) this.startDivision();
   }
@@ -185,14 +229,18 @@ function fract(v){ return v - Math.floor(v); }
  }
  Spiral.nextId = 1;
 
+ // Data structures
  const spirals = [];
  let totalKilled = 0;
  let recordMaxPop = parseInt(localStorage.getItem('tp_record_maxpop')||'0',10) || 0;
+
  function addSpiral(s){ spirals.push(s); updateHUD(); checkAndUpdateMaxPop(); }
  function removeDead(){ let write=0; for(let read=0; read<spirals.length; read++){ if(!spirals[read]._dead) spirals[write++]=spirals[read]; } if(write!==spirals.length) spirals.length = write; updateHUD(); }
  function checkAndUpdateMaxPop(){ if(spirals.length > recordMaxPop){ recordMaxPop = spirals.length; localStorage.setItem('tp_record_maxpop', String(recordMaxPop)); document.getElementById('recordMaxPop').textContent = 'Peak population: ' + recordMaxPop; } }
 
  const noise = new SimpleNoise(Math.random()*1000);
+
+ // Running state
  let running = false;
  let last = performance.now();
  let lodMode = false;
@@ -212,20 +260,57 @@ function fract(v){ return v - Math.floor(v); }
  let gameStartAt = null;
  function updateHUD(){ spCountEl.textContent = 'T. pallidum: ' + spirals.length; killedCountEl.textContent = 'Total killed: ' + totalKilled; recordMaxPopEl.textContent = 'Peak population: ' + recordMaxPop; killBtn.textContent = `Kill (${charges})`; if(charges > 0) killBtn.classList.remove('muted'); else killBtn.classList.add('muted'); if(running && gameStartAt){ const elapsed = (performance.now() - gameStartAt)/1000; timeStatEl.textContent = 'Time: ' + formatTimeHHMMSS(elapsed); } }
 
- function spawnInitial(count){ const bounds = {x:120, y:72, z:20}; const cols = Math.ceil(Math.sqrt(count)); const rows = Math.ceil(count / cols); let idx = 0; for(let r=0;r<rows && idx<count;r++){ for(let c=0;c<cols && idx<count;c++){ const fx = (c + 0.5) / cols; const fy = (r + 0.5) / rows; const x = (fx - 0.5) * bounds.x * 2 + rand(-6,6); const y = (fy - 0.5) * bounds.y * 2 + rand(-4,4); const z = rand(-8,8); addSpiral(new Spiral(Spiral.nextId++, new THREE.Vector3(x,y,z))); idx++; } } }
+ function spawnInitial(count){
+  const bounds = {x:120, y:72, z:20};
+  const cols = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / cols);
+  let idx = 0;
+  for(let r=0;r<rows && idx<count;r++){
+   for(let c=0;c<cols && idx<count;c++){
+    const fx = (c + 0.5) / cols;
+    const fy = (r + 0.5) / rows;
+    const x = (fx - 0.5) * bounds.x * 2 + rand(-6,6);
+    const y = (fy - 0.5) * bounds.y * 2 + rand(-4,4);
+    const z = rand(-8,8);
+    addSpiral(new Spiral(Spiral.nextId++, new THREE.Vector3(x,y,z)));
+    idx++;
+   }
+  }
+ }
 
- function resetGameStateBeforeStart(){ for(const s of spirals) s.dispose(); spirals.length = 0; Spiral.nextId = 1; totalKilled = 0; charges = CONFIG.killMaxCharges; nextChargeReadyAt = null; recordMaxPop = 0; localStorage.setItem('tp_record_maxpop', String(recordMaxPop)); banner.classList.remove('show'); updateHUD(); }
+ function resetGameStateBeforeStart(){
+  for(const s of spirals) s.dispose();
+  spirals.length = 0;
+  Spiral.nextId = 1;
+  totalKilled = 0;
+  charges = CONFIG.killMaxCharges;
+  nextChargeReadyAt = null;
+  recordMaxPop = 0;
+  localStorage.setItem('tp_record_maxpop', String(recordMaxPop));
+  banner.classList.remove('show');
+  updateHUD();
+  // remove instanced LOD if present
+  if(Shared.instancedLOD){
+   scene.remove(Shared.instancedLOD);
+   Shared.instancedLOD.geometry.dispose();
+   Shared.instancedLOD.material.dispose();
+   Shared.instancedLOD = null;
+   Shared.instancedCount = 0;
+  }
+ }
 
  function startGame(){ resetGameStateBeforeStart(); spawnInitial(CONFIG.startCount); running = true; last = performance.now(); gameStartAt = performance.now(); updateHUD(); }
+
  function gameOver(victory=false){ running = false; const msg = victory ? 'Victory over Treponema pallidum' : 'Defeat — overflow!'; banner.textContent = msg; banner.classList.add('show'); }
+
  function rng(){ return Math.random(); }
  function compute_p_hit(sp){ return clamp(0.8 + (Math.random()-0.5)*0.2, 0.10, 0.97); }
 
  function doKill(){ if(!running) return; if(charges <= 0) return; charges--; if(charges < CONFIG.killMaxCharges && !nextChargeReadyAt) nextChargeReadyAt = performance.now() + CONFIG.killCooldownBetweenUses_s*1000; updateHUD(); for(let i=spirals.length-1;i>=0;i--){ const s = spirals[i]; const p = compute_p_hit(s); const res = s.killAttempt(p, rng); if(res === 'dead') totalKilled++; } removeDead(); updateHUD(); if(spirals.length === 0) gameOver(true); }
-
  killBtn.addEventListener('click', ()=> doKill());
  startBtn.addEventListener('click', ()=> startGame());
 
+ // Modal and helpers
  const modalBackdrop = document.getElementById('modalBackdrop');
  const modalInner = document.getElementById('modalInner');
  const modalClose = document.getElementById('modalClose');
@@ -233,6 +318,7 @@ function fract(v){ return v - Math.floor(v); }
  function closeModal(){ modalBackdrop.style.display = 'none'; modalInner.innerHTML = ''; }
  modalClose.addEventListener('click', closeModal);
  modalBackdrop.addEventListener('click', (e)=>{ if(e.target===modalBackdrop) closeModal(); });
+
  const rulesBtn = document.getElementById('rulesBtn');
  const donatesBtn = document.getElementById('donatesBtn');
  rulesBtn.addEventListener('click', ()=> {
@@ -263,11 +349,98 @@ function fract(v){ return v - Math.floor(v); }
  });
  function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
- // Main loop
+ /* =========================
+    Performance / Render control
+    - Frame cap via minRenderIntervalMs (switchable)
+    - Dynamic renderScale adjustment when frame time high
+    - Instanced LOD creation when many objects to reduce draw calls
+    - Basic perf sampling to auto-throttle
+   ========================= */
+
+ // Perf sampler
+ const perf = { samples: [], lastSampleTs: performance.now(), avgFrameMs: 0 };
+ function sampleFrame(ms){
+  const now = performance.now();
+  perf.samples.push(ms);
+  // keep window
+  while(perf.samples.length > 60) perf.samples.shift();
+  // update average every sampling period
+  if(now - perf.lastSampleTs > CONFIG.perfSamplingMs){
+   const sum = perf.samples.reduce((a,b)=>a+b,0);
+   perf.avgFrameMs = sum / perf.samples.length;
+   perf.lastSampleTs = now;
+   // Auto throttle: if avg frame too high, lower renderScale and/or cap FPS
+   if(perf.avgFrameMs > CONFIG.autoThrottleFPSDropThreshold){
+    // decrease render scale
+    currentRenderScale = Math.max(CONFIG.lowRenderScale, currentRenderScale - 0.05);
+    applyRenderSize(currentRenderScale);
+    // increase minRenderIntervalMs (lower FPS) but not below low cap
+    if(!highPerfMode) CONFIG.minRenderIntervalMs = Math.min(1000/20, Math.max(CONFIG.minRenderIntervalMs, perf.avgFrameMs));
+   } else {
+    // gentle recovery
+    if(currentRenderScale < CONFIG.dynamicRenderScale){
+     currentRenderScale = Math.min(CONFIG.dynamicRenderScale, currentRenderScale + 0.05);
+     applyRenderSize(currentRenderScale);
+    }
+    // restore FPS cap
+    CONFIG.minRenderIntervalMs = highPerfMode ? CONFIG.highPerfRenderIntervalMs : 1000/30;
+   }
+  }
+ }
+
+ // Instanced LOD creation helper
+ function ensureInstancedLOD(){
+  if(Shared.instancedLOD) return;
+  ensureSharedResources();
+  const count = spirals.length;
+  if(count === 0) return;
+  const geom = Shared.lodGeom.clone();
+  const mat = Shared.lodMat.clone();
+  // Use InstancedMesh with a reasonable batch size limit
+  const inst = new THREE.InstancedMesh(geom, mat, count);
+  const dummy = new THREE.Object3D();
+  for(let i=0;i<count;i++){
+   const s = spirals[i];
+   dummy.position.copy(s.pos);
+   dummy.updateMatrix();
+   inst.setMatrixAt(i, dummy.matrix);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  Shared.instancedLOD = inst;
+  Shared.instancedCount = count;
+  scene.add(inst);
+  // remove individual meshes to cut draw calls
+  for(let i=0;i<spirals.length;i++){
+   if(spirals[i].mesh){ scene.remove(spirals[i].mesh); spirals[i].mesh = null; }
+  }
+ }
+
+ function updateInstancedLODMatrices(){
+  if(!Shared.instancedLOD) return;
+  const dummy = new THREE.Object3D();
+  const limit = Math.min(Shared.instancedCount, spirals.length);
+  for(let i=0;i<limit;i++){
+   dummy.position.copy(spirals[i].pos);
+   dummy.updateMatrix();
+   Shared.instancedLOD.setMatrixAt(i, dummy.matrix);
+  }
+  Shared.instancedLOD.instanceMatrix.needsUpdate = true;
+ }
+
+ /* =========================
+    Main loop with capped FPS and renderScale handling
+   ========================= */
+
  let acc = 0;
  const fixedDt = 16.6667;
  let lastRenderTime = performance.now();
  let lastActivityTime = performance.now();
+
+ // initial minRenderIntervalMs set
+ CONFIG.minRenderIntervalMs = 1000/30;
+
+ // performance measurement for sampleFrame
+ let lastFrameTs = performance.now();
 
  function tickLoop(now){
   requestAnimationFrame(tickLoop);
@@ -277,19 +450,66 @@ function fract(v){ return v - Math.floor(v); }
   last = now;
   acc += dt;
 
+  // progress division animations at higher rate but light operations
   const perfNow = performance.now();
   for(let i=0;i<spirals.length;i++){ const s = spirals[i]; if(s.isAnimatingDivision) s.progressDivision(perfNow); }
 
-  while(acc >= fixedDt){ step(fixedDt); acc -= fixedDt; }
+  while(acc >= fixedDt){
+   step(fixedDt);
+   acc -= fixedDt;
+  }
 
+  // decide if LOD instancing is needed
+  if(spirals.length > CONFIG.lodThreshold && !Shared.instancedLOD){
+   // create instanced LOD and stop creating many Mesh objects
+   ensureInstancedLOD();
+   lodMode = true;
+  } else if(spirals.length <= CONFIG.lodThreshold && Shared.instancedLOD){
+   // teardown instanced LOD and restore individual meshes
+   scene.remove(Shared.instancedLOD);
+   Shared.instancedLOD.geometry.dispose();
+   Shared.instancedLOD.material.dispose();
+   Shared.instancedLOD = null;
+   Shared.instancedCount = 0;
+   // restore meshes (they'll be re-created lazily)
+   for(let i=0;i<spirals.length;i++) spirals[i].restoreSpiralMesh();
+   lodMode = false;
+  }
+
+  // update transforms
+  const nowPerf = performance.now();
+  for(let i=0;i<spirals.length;i++) spirals[i].update(dt, nowPerf, noise);
+  removeDead();
+
+  // update instanced matrices if in instanced LOD
+  if(Shared.instancedLOD) updateInstancedLODMatrices();
+
+  updateHUD();
+
+  // determine rendering need
   const sinceLastRender = perfNow - lastRenderTime;
   const needRender = running || (perfNow - lastActivityTime < 2000);
-  if(needRender && sinceLastRender >= CONFIG.minRenderIntervalMs){ renderer.render(scene, camera); lastRenderTime = perfNow; }
-  else if(!needRender && sinceLastRender >= 250){ renderer.render(scene, camera); lastRenderTime = perfNow; }
+
+  // use dynamic FPS cap
+  const minInterval = highPerfMode ? CONFIG.highPerfRenderIntervalMs : CONFIG.minRenderIntervalMs;
+  if(needRender && sinceLastRender >= minInterval){
+   const t0 = performance.now();
+   renderer.render(scene, camera);
+   lastRenderTime = performance.now();
+   const frameMs = lastRenderTime - t0;
+   sampleFrame(frameMs);
+   // quick sample for overall frame (includes scheduling)
+   sampleFrame(performance.now() - lastFrameTs);
+   lastFrameTs = performance.now();
+  } else if(!needRender && sinceLastRender >= 250){
+   renderer.render(scene, camera);
+   lastRenderTime = perfNow;
+  }
  }
 
  function step(dt){
   if(running){
+   // charge regen
    if(charges < CONFIG.killMaxCharges && nextChargeReadyAt){
     if(performance.now() >= nextChargeReadyAt){
      charges++;
@@ -297,33 +517,44 @@ function fract(v){ return v - Math.floor(v); }
      if(charges >= CONFIG.killMaxCharges){ charges = CONFIG.killMaxCharges; nextChargeReadyAt = null; }
     }
    }
+   // recovery UI
    if(charges < CONFIG.killMaxCharges && nextChargeReadyAt){
     const sLeft = Math.ceil((nextChargeReadyAt - performance.now())/1000);
     recoveryEl.textContent = 'Recover in: ' + sLeft + 's';
    } else recoveryEl.textContent = 'Recover in: —';
 
-   if(spirals.length > CONFIG.lodThreshold && !lodMode){ lodMode = true; for(let i=0;i<spirals.length;i++) spirals[i].toPointLOD(); }
-   else if(spirals.length <= CONFIG.lodThreshold && lodMode){ lodMode = false; for(let i=0;i<spirals.length;i++) spirals[i].restoreSpiralMesh(); }
+   // update animations & movement done in tickLoop per spiral
 
-   const nowPerf = performance.now();
-   for(let i=0;i<spirals.length;i++) spirals[i].update(dt, nowPerf, noise);
-
-   removeDead();
+   // safety check
    if(spirals.length > CONFIG.maxSpirals) gameOver(false);
-   updateHUD();
   }
  }
 
+ // start
  startGame();
  requestAnimationFrame(tickLoop);
+
+ // Resize handling: respect render scale
  window.addEventListener('resize', ()=> {
-  const w = container.clientWidth;
-  const h = container.clientHeight;
-  renderer.setSize(Math.max(700,w), Math.max(420,h));
-  camera.aspect = renderer.domElement.width/renderer.domElement.height;
-  camera.updateProjectionMatrix();
+  applyRenderSize(currentRenderScale);
  });
+
+ // Activity sampler
  ['mousemove','mousedown','keydown','touchstart'].forEach(ev => window.addEventListener(ev, ()=> { lastActivityTime = performance.now(); }, {passive:true}));
+
+ // Expose a simple toggle for high perf mode (double-click HUD start button)
+ startBtn.addEventListener('dblclick', ()=>{
+  highPerfMode = !highPerfMode;
+  CONFIG.minRenderIntervalMs = highPerfMode ? CONFIG.highPerfRenderIntervalMs : (1000/30);
+  // immediate apply higher quality when entering high perf
+  if(highPerfMode){ currentRenderScale = Math.min(1.0, CONFIG.dynamicRenderScale + 0.15); applyRenderSize(currentRenderScale); }
+  else { currentRenderScale = CONFIG.dynamicRenderScale; applyRenderSize(currentRenderScale); }
+  // brief banner
+  banner.textContent = highPerfMode ? 'High Perf: 60 FPS' : 'Balanced Perf: 30 FPS';
+  banner.classList.add('show');
+  setTimeout(()=> banner.classList.remove('show'), 1500);
+ });
+
 })();
 </script>
 </body>
