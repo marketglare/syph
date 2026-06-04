@@ -1,0 +1,12 @@
+{
+  "name": "Treponema Hunter",
+  "short_name": "Treponema",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#061318",
+  "theme_color": "#061318",
+  "icons": [
+    { "src": "icon-196.png", "sizes": "196x196", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
