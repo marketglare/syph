@@ -6,6 +6,8 @@
 <title>Syph</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#061318">
+<meta name="description" content="Syphilis is a great simulator. Our interactive game shows how it disguises itself and why it's important to get treatment promptly. Administer medication and defeat the bacteria">
+<meta name="keywords" content="syphilis, treatment, simulator, game, health, treponema pallidum">
 <style>
 html,body{height:100%;margin:0;background:#061318;color:#e6f6ff;font-family:system-ui,Segoe UI,Roboto,Arial}
 #app{height:100%;display:flex;flex-direction:column}
@@ -136,8 +138,14 @@ donatesBtn.addEventListener('click', ()=> {
  const txt = [
    "USDT (TRC-20) address: TSR63AMR4ToAyhFvGsBJ4C8ikAeM6Fn5TT",
    "SHIB (ERC-20) address: 0x4C97c50666a5553326d2289e2dD683dE30145A33",
-   
-   "Email: marketglare@gmail.com"
+   "",
+   "Why crypto?",
+   "— Anonymous (no one will recognize you)",
+   "— Instant (no banks)",
+   "— Global (from any country)",
+   "— It's cheap now! Your donation carries more weight.",
+   "",
+   "Email: marketglare@gmail.com (en/ru)"
  ].join("\n");
  showModal("<h2>"+escapeHtml(L('donatesBtn'))+"</h2><pre style='white-space:pre-wrap'>"+escapeHtml(txt)+"</pre>");
 });
