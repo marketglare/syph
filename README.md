@@ -1,5 +1,6 @@
 # syph
 
+Syphilis is a great simulator. Our interactive game shows how it disguises itself and why it's important to get treatment promptly. Administer medication and defeat the bacteria.
 This is a simulator of Syphilis, a disease caused by the division of Treponema Pallidum bacteria.
 
 Objective: 
@@ -14,7 +15,6 @@ Release from the dormant phase is random, within 1-6 in-game days (30-180 second
 
 Win condition: 
 All treponemas are defeated.
-
 Defeat condition: 
 The treponema has multiplied more than 1000 units.
 
